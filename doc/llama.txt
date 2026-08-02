@@ -276,9 +276,12 @@ keymaps parameters:
 
 - {keymap_fim_accept_full}	keymap to accept full suggestion, default: <Tab>
 
-- {keymap_fim_accept_line}	keymap to accept line suggestion, default: <S-Tab>
+- {keymap_fim_accept_line}	keymap to accept a suggested line and move to the
+					next line, default: <S-Tab>
 
-- {keymap_fim_accept_word}	keymap to accept word suggestion, default: <C-B>
+- {keymap_fim_accept_word}	keymap to accept a suggested word. Accepting the
+					last word moves to the next line only when the
+					suggestion continues there, default: <C-B>
 
 - {keymap_fim_next}		keymap to cycle to next completion, default: <C-J>
 

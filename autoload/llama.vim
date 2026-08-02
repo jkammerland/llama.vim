@@ -1588,8 +1588,9 @@ function! s:fim_render(pos_x, pos_y, responses, selected)
 endfunction
 
 " if accept_type == 'full', accept entire response
-" if accept_type == 'line', accept only the first line of the response
-" if accept_type == 'word', accept only the first word of the response
+" if accept_type == 'line', accept the first line and its line break
+" if accept_type == 'word', accept the first word and advance after the final
+" word on a line when the response continues
 function! llama#fim_accept(accept_type)
     let l:pos_x  = s:fim_data['pos_x']
     let l:pos_y  = s:fim_data['pos_y']
@@ -1598,6 +1599,7 @@ function! llama#fim_accept(accept_type)
 
     let l:can_accept = s:fim_data['can_accept']
     let l:content    = s:fim_data['content']
+    let l:advance_to_next_line = v:false
 
     if l:can_accept && len(l:content) > 0
         " insert suggestion on current line
@@ -1607,7 +1609,13 @@ function! llama#fim_accept(accept_type)
         else
             " insert first word of suggestion
             let l:suffix = l:line_cur[(l:pos_x):]
-            let l:word = matchstr(l:content[0][:-(len(l:suffix) + 1)], '^\s*\S\+')
+            let l:suggested = l:content[0]
+            if len(l:content) == 1 && !empty(l:suffix)
+                let l:suggested = strpart(l:suggested, 0, strlen(l:suggested) - strlen(l:suffix))
+            endif
+            let l:word = matchstr(l:suggested, '^\s*\S\+')
+            let l:remaining = strpart(l:suggested, strlen(l:word))
+            let l:advance_to_next_line = !empty(l:word) && l:remaining =~# '^\s*$' && len(l:content) > 1
             call setline(l:pos_y, l:line_cur[:(l:pos_x - 1)] . l:word . l:suffix)
         endif
 
@@ -1620,13 +1628,19 @@ function! llama#fim_accept(accept_type)
         if a:accept_type == 'word'
             " move cursor to end of word
             call cursor(l:pos_y, l:pos_x + len(l:word) + 1)
-        elseif a:accept_type == 'line' || len(l:content) == 1
-            " move cursor for 1-line suggestion
-            call cursor(l:pos_y, l:pos_x + len(l:content[0]) + 1)
-            if len(l:content) > 1
-                " simulate pressing Enter to move to next line
+            if l:advance_to_next_line
+                " Continue on the next suggested line after accepting the last
+                " word on the current line.
                 call feedkeys("\<CR>")
             endif
+        elseif a:accept_type == 'line'
+            " A line acceptance includes its line break, even when there is
+            " no subsequent suggestion line.
+            call cursor(l:pos_y, l:pos_x + len(l:content[0]) + 1)
+            call feedkeys("\<CR>")
+        elseif len(l:content) == 1
+            " move cursor for 1-line full suggestion
+            call cursor(l:pos_y, l:pos_x + len(l:content[0]) + 1)
         else
             " move cursor for multi-line suggestion
             call cursor(l:pos_y + len(l:content) - 1, len(l:content[-1]) + 1)
