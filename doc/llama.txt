@@ -124,6 +124,8 @@ Currently the default config is:
 		    \ 'auto_fim':               v:true,
 		    \ 'max_line_suffix':        8,
 		    \ 'max_cache_keys':         250,
+		    \ 'context_providers':      [],
+		    \ 'context_providers_enabled': v:true,
 		    \ 'ring_n_chunks':          16,
 		    \ 'ring_chunk_size':        64,
 		    \ 'ring_scope':             1024,
@@ -191,6 +193,64 @@ Currently the default config is:
 						of the cursor
 
 - {max_cache_keys}		max number of cached completions to keep in result_cache
+
+- {context_providers}	list of synchronous providers that add extra context
+						to FIM requests. Providers run in list order, so multiple
+						providers can contribute to one request. A provider can be
+						a function, or a dictionary with {provider}, optional {cond},
+						and optional {name} entries. Functions receive a dictionary
+						with {bufnr}, {filename}, {filetype}, {line} (1-based),
+						and {column} (0-based byte column), and returns a list of
+						`{'filename': string, 'text': string}` chunks. Invalid chunks
+						and provider errors are skipped. Providers must return cached
+						data immediately; do not wait for external services.
+
+						Provider chunks are appended after ring context and are part
+						of the FIM completion cache key.
+
+						Example:
+>vim
+						function! MyContext(ctx) abort
+						    if a:ctx.filetype !=# 'cpp'
+						        return []
+						    endif
+						    return [{'filename': 'include/api.hpp', 'text': 'Result run(Context&);'}]
+						endfunction
+
+						let g:llama_config.context_providers = [function('MyContext')]
+<
+						A descriptor condition receives the same context dictionary.
+						When it returns false, its provider is not called. Conditions
+						are useful for configuration-specific routing; providers should
+						still return an empty list when used outside their own scope.
+>vim
+						function! IsCpp(ctx) abort
+						    return index(['c', 'cpp'], a:ctx.filetype) >= 0
+						endfunction
+
+						let g:llama_config.context_providers = [
+						    \ {'name': 'clangd', 'cond': function('IsCpp'), 'provider': function('MyContext')},
+						    \ function('AnotherContext'),
+						    \ ]
+<
+
+- {context_providers_enabled}	whether to call context providers for FIM
+						requests (v:true by default). Set this to v:false to
+						disable every configured provider without changing its
+						registration. Provider output is part of the FIM cache key,
+						so toggling this setting will not reuse a completion made
+						with different provider context.
+
+						let g:llama_config.context_providers_enabled = v:false
+
+						Use :LlamaToggleContextProviders to toggle the setting
+						interactively. In Lua, reassign the modified configuration
+						table so the value reaches Vimscript:
+>lua
+						local config = vim.g.llama_config
+						config.context_providers_enabled = false
+						vim.g.llama_config = config
+<
 
 - {enable_at_startup}	whether to enable llama.vim functionality at startup
 						(v:true to enable, v:false to disable; default: v:true)

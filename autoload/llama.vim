@@ -32,6 +32,7 @@ highlight default llama_hl_fim_info guifg=#77ff2f ctermfg=119
 "   auto_fim:         trigger FIM completion automatically on cursor movement
 "   max_line_suffix:  do not auto-trigger FIM completion if there are more than this number of characters to the right of the cursor
 "   max_cache_keys:   max number of cached completions to keep in result_cache
+"   context_providers: list of synchronous functions that return extra FIM context chunks
 "   enable_at_startup: enable llama.vim functionality at startup (default: v:true)
 "
 " ring buffer of chunks, accumulated with time upon:
@@ -84,6 +85,8 @@ let s:default_config = {
     \ 'auto_fim':               v:true,
     \ 'max_line_suffix':        8,
     \ 'max_cache_keys':         250,
+    \ 'context_providers':      [],
+    \ 'context_providers_enabled': v:true,
     \ 'ring_n_chunks':          16,
     \ 'ring_chunk_size':        64,
     \ 'ring_scope':             1024,
@@ -288,6 +291,12 @@ function! llama#toggle_auto_fim()
     call llama#setup_autocmds()
 endfunction
 
+function! llama#toggle_context_providers()
+    let g:llama_config.context_providers_enabled = get(g:llama_config, 'context_providers_enabled', v:true) ? v:false : v:true
+    call llama#fim_hide()
+    echo 'Llama context providers: ' . (g:llama_config.context_providers_enabled ? 'ON' : 'OFF')
+endfunction
+
 function! llama#status()
     let l:fim_base = substitute(g:llama_config.endpoint_fim, '/infill$', '', '')
     let l:inst_base = substitute(g:llama_config.endpoint_inst, '/v1/chat/completions$', '', '')
@@ -424,6 +433,7 @@ function! llama#setup()
     command! LlamaDisable        call llama#disable()
     command! LlamaToggle         call llama#toggle()
     command! LlamaToggleAutoFim  call llama#toggle_auto_fim()
+    command! LlamaToggleContextProviders call llama#toggle_context_providers()
     command! LlamaStatus         call llama#status()
 
     command! -range=% LlamaInstruct call llama#inst(<line1>, <line2>)
@@ -853,6 +863,114 @@ function! s:fim_ctx_local(pos_x, pos_y, prev)
     return l:res
 endfunction
 
+" Gather caller-provided FIM context. Providers are deliberately synchronous:
+" they must return cached data and must not wait for external services.
+function! s:fim_ctx_provider(pos_x, pos_y)
+    if !get(g:llama_config, 'context_providers_enabled', v:true)
+        return []
+    endif
+
+    let l:providers = get(g:llama_config, 'context_providers', [])
+    if type(l:providers) != v:t_list
+        call llama#debug_log('context_providers must be a list')
+        return []
+    endif
+
+    let l:ctx = {
+        \ 'bufnr':    bufnr('%'),
+        \ 'filename': expand('%:p'),
+        \ 'filetype': &filetype,
+        \ 'line':     a:pos_y,
+        \ 'column':   a:pos_x,
+        \ }
+    let l:extra = []
+
+    for l:Entry in l:providers
+        let l:Provider = v:null
+        let l:Cond = v:null
+        let l:name = 'context provider'
+
+        if type(l:Entry) == v:t_func
+            let l:Provider = l:Entry
+        elseif type(l:Entry) == v:t_dict
+            let l:Provider = get(l:Entry, 'provider', v:null)
+            let l:Cond = get(l:Entry, 'cond', v:null)
+            let l:name = get(l:Entry, 'name', l:name)
+            if type(l:name) != v:t_string || empty(l:name)
+                let l:name = 'context provider'
+            endif
+        else
+            call llama#debug_log('skipping a context provider entry that is not callable or a dictionary')
+            continue
+        endif
+
+        if type(l:Provider) != v:t_func
+            call llama#debug_log('skipping ' . l:name . ' because its provider is not callable')
+            continue
+        endif
+
+        if l:Cond isnot v:null
+            if type(l:Cond) != v:t_func
+                call llama#debug_log('skipping ' . l:name . ' because its condition is not callable')
+                continue
+            endif
+
+            try
+                if !call(l:Cond, [l:ctx])
+                    continue
+                endif
+            catch
+                call llama#debug_log(l:name . ' condition failed: ' . v:exception)
+                continue
+            endtry
+        endif
+
+        try
+            let l:chunks = call(l:Provider, [l:ctx])
+        catch
+            call llama#debug_log(l:name . ' failed: ' . v:exception)
+            continue
+        endtry
+
+        if type(l:chunks) != v:t_list
+            if l:chunks isnot v:null
+                call llama#debug_log(l:name . ' must return a list of chunks')
+            endif
+            continue
+        endif
+
+        for l:chunk in l:chunks
+            if type(l:chunk) != v:t_dict
+                call llama#debug_log('skipping a context chunk that is not a dictionary')
+                continue
+            endif
+
+            let l:text = get(l:chunk, 'text', v:null)
+            if type(l:text) != v:t_string || empty(l:text)
+                call llama#debug_log('skipping a context chunk without text')
+                continue
+            endif
+
+            let l:filename = get(l:chunk, 'filename', 'context-provider')
+            if type(l:filename) != v:t_string || empty(l:filename)
+                let l:filename = 'context-provider'
+            endif
+
+            call add(l:extra, {'filename': l:filename, 'text': l:text})
+        endfor
+    endfor
+
+    return l:extra
+endfunction
+
+function! s:fim_ctx_provider_fingerprint(extra)
+    return sha256(json_encode(a:extra))
+endfunction
+
+function! s:fim_cache_hash(prefix, middle, suffix, provider_fingerprint)
+    return sha256(a:prefix . a:middle . 'Î' . a:suffix . 'Î' . a:provider_fingerprint)
+endfunction
+
 " necessary for 'inoremap <expr>'
 function! llama#fim_inline(is_auto, use_cache) abort
     " exit if not enabled
@@ -908,6 +1026,8 @@ function! llama#fim(pos_x, pos_y, is_auto, prev, use_cache) abort
     let l:middle = l:ctx_local['middle']
     let l:suffix = l:ctx_local['suffix']
     let l:indent = l:ctx_local['indent']
+    let l:provider_extra = s:fim_ctx_provider(l:pos_x, l:pos_y)
+    let l:provider_fingerprint = s:fim_ctx_provider_fingerprint(l:provider_extra)
 
     if a:is_auto && len(l:ctx_local['line_cur_suffix']) > g:llama_config.max_line_suffix
         return
@@ -925,7 +1045,7 @@ function! llama#fim(pos_x, pos_y, is_auto, prev, use_cache) abort
     "
     let l:hashes = []
 
-    call add(l:hashes, sha256(l:prefix . l:middle . 'Î' . l:suffix))
+    call add(l:hashes, s:fim_cache_hash(l:prefix, l:middle, l:suffix, l:provider_fingerprint))
 
     let l:prefix_trim = l:prefix
     for i in range(3)
@@ -934,7 +1054,7 @@ function! llama#fim(pos_x, pos_y, is_auto, prev, use_cache) abort
             break
         endif
 
-        call add(l:hashes, sha256(l:prefix_trim . l:middle . 'Î' . l:suffix))
+        call add(l:hashes, s:fim_cache_hash(l:prefix_trim, l:middle, l:suffix, l:provider_fingerprint))
     endfor
 
     " if we already have a cached completion for one of the hashes, don't send a request
@@ -968,6 +1088,7 @@ function! llama#fim(pos_x, pos_y, is_auto, prev, use_cache) abort
     endfor
 
     let l:extra = s:ring_get_extra()
+    call extend(l:extra, l:provider_extra)
 
     let l:request = {
         \ 'id_slot':          0,
@@ -1151,9 +1272,11 @@ function! s:fim_try_hint(pos_x, pos_y)
     let l:prefix = l:ctx_local['prefix']
     let l:middle = l:ctx_local['middle']
     let l:suffix = l:ctx_local['suffix']
+    let l:provider_extra = s:fim_ctx_provider(l:pos_x, l:pos_y)
+    let l:provider_fingerprint = s:fim_ctx_provider_fingerprint(l:provider_extra)
 
     " Phase 1: exact match at current position
-    let l:hash = sha256(l:prefix . l:middle . 'Î' . l:suffix)
+    let l:hash = s:fim_cache_hash(l:prefix, l:middle, l:suffix, l:provider_fingerprint)
     let l:responses = s:cache_get(l:hash)
 
     if l:responses isnot v:null && len(l:responses) > 0
@@ -1177,7 +1300,7 @@ function! s:fim_try_hint(pos_x, pos_y)
     for i in range(128)
         let l:typed = l:pm[-(1 + i):]
         let l:ctx_new = l:pm[:-(2 + i)] . 'Î' . l:suffix
-        let l:hash_new = sha256(l:ctx_new)
+        let l:hash_new = sha256(l:ctx_new . 'Î' . l:provider_fingerprint)
 
         let l:cached = s:cache_get(l:hash_new)
         if l:cached is v:null
