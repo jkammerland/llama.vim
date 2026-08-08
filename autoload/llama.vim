@@ -229,24 +229,14 @@ function! llama#disable()
 
     autocmd! llama
 
-    " TODO: these unmaps don't seem to work properly
+    " the accept/cycle maps are torn down by the llama#fim_hide() call above, which knows
+    " which buffer they were installed in
+    "
+    " TODO: this unmap still only reaches the current buffer. keymap_fim_trigger is mapped
+    " per-buffer from an InsertEnter autocmd, so disabling from one buffer leaves it behind
+    " in every other buffer that was ever entered.
     if g:llama_config.keymap_fim_trigger != ''
         exe "silent! iunmap <buffer> " .. g:llama_config.keymap_fim_trigger
-    endif
-    if g:llama_config.keymap_fim_accept_full != ''
-        exe "silent! iunmap <buffer> " .. g:llama_config.keymap_fim_accept_full
-    endif
-    if g:llama_config.keymap_fim_accept_line != ''
-        exe "silent! iunmap <buffer> " .. g:llama_config.keymap_fim_accept_line
-    endif
-    if g:llama_config.keymap_fim_accept_word != ''
-        exe "silent! iunmap <buffer> " .. g:llama_config.keymap_fim_accept_word
-    endif
-    if g:llama_config.keymap_fim_next != ''
-        exe "silent! iunmap <buffer> " .. g:llama_config.keymap_fim_next
-    endif
-    if g:llama_config.keymap_fim_prev != ''
-        exe "silent! iunmap <buffer> " .. g:llama_config.keymap_fim_prev
     endif
 
     if g:llama_config.keymap_debug_toggle != ''
@@ -1338,6 +1328,67 @@ function! s:fim_try_hint(pos_x, pos_y)
     endif
 endfunction
 
+" the buffer-local keymaps installed while a FIM hint is on screen,
+" as [lhs, rhs, is_expr] triples
+"
+" Install and teardown must name the buffer explicitly. A hint rendered in one buffer is
+" routinely hidden while a different buffer is current, and a bare 'iunmap <buffer>' then
+" silently removes nothing -- leaving the mapping behind to shadow whatever the user had
+" bound globally to the same key.
+function! s:fim_keymaps()
+    let l:maps = []
+
+    for [l:opt, l:kind] in [
+                \ ['keymap_fim_accept_full', 'full'],
+                \ ['keymap_fim_accept_line', 'line'],
+                \ ['keymap_fim_accept_word', 'word'],
+                \ ]
+        if g:llama_config[l:opt] != ''
+            call add(l:maps, [g:llama_config[l:opt], '<C-O>:call llama#fim_accept(''' . l:kind . ''')<CR>', v:false])
+        endif
+    endfor
+
+    " cycle shortcuts are mapped whenever a hint is shown (to prevent <C-J>/<C-K> from
+    " moving the cursor); llama#fim_cycle returns '' early when there is nothing to cycle
+    for [l:opt, l:dir] in [['keymap_fim_next', 1], ['keymap_fim_prev', -1]]
+        if g:llama_config[l:opt] != ''
+            call add(l:maps, [g:llama_config[l:opt], 'llama#fim_cycle(' . l:dir . ')', v:true])
+        endif
+    endfor
+
+    return l:maps
+endfunction
+
+function! s:fim_map_keys(bufnr)
+    for [l:lhs, l:rhs, l:is_expr] in s:fim_keymaps()
+        if s:ghost_text_nvim
+            call nvim_buf_set_keymap(a:bufnr, 'i', l:lhs, l:rhs,
+                        \ {'noremap': v:true, 'silent': v:true, 'expr': l:is_expr})
+        elseif l:is_expr
+            exe 'inoremap <expr> <buffer> ' . l:lhs . ' ' . l:rhs
+        else
+            exe 'inoremap <buffer> ' . l:lhs . ' ' . l:rhs
+        endif
+    endfor
+endfunction
+
+" a:bufnr is the buffer the hint was rendered in, not necessarily the current one
+function! s:fim_unmap_keys(bufnr)
+    if a:bufnr <= 0 || !bufexists(a:bufnr)
+        return
+    endif
+
+    for [l:lhs, l:rhs, l:is_expr] in s:fim_keymaps()
+        if s:ghost_text_nvim
+            " throws when the mapping is absent, which is a normal state here
+            silent! call nvim_buf_del_keymap(a:bufnr, 'i', l:lhs)
+        else
+            " Vim has no buffer-explicit unmap; retains the historical behaviour
+            exe 'silent! iunmap <buffer> ' . l:lhs
+        endif
+    endfor
+endfunction
+
 " render a suggestion at the current cursor location
 " a:responses  - list of response objects from cache
 " a:selected   - index of the currently selected completion
@@ -1554,28 +1605,13 @@ function! s:fim_render(pos_x, pos_y, responses, selected)
         endif
     endif
 
-    " setup accept shortcuts
-    if g:llama_config.keymap_fim_accept_full != ''
-        exe 'inoremap <buffer> ' . g:llama_config.keymap_fim_accept_full . ' <C-O>:call llama#fim_accept(''full'')<CR>'
-    endif
-    if g:llama_config.keymap_fim_accept_line != ''
-        exe 'inoremap <buffer> ' . g:llama_config.keymap_fim_accept_line . ' <C-O>:call llama#fim_accept(''line'')<CR>'
-    endif
-    if g:llama_config.keymap_fim_accept_word != ''
-        exe 'inoremap <buffer> ' . g:llama_config.keymap_fim_accept_word . ' <C-O>:call llama#fim_accept(''word'')<CR>'
-    endif
-
-    " setup cycle shortcuts (always, to prevent <C-J>/<C-K> from moving the cursor)
-    " llama#fim_cycle returns '' early when there is nothing to cycle
-    if g:llama_config.keymap_fim_next != ''
-        exe 'inoremap <expr> <buffer> ' . g:llama_config.keymap_fim_next . ' llama#fim_cycle(1)'
-    endif
-    if g:llama_config.keymap_fim_prev != ''
-        exe 'inoremap <expr> <buffer> ' . g:llama_config.keymap_fim_prev . ' llama#fim_cycle(-1)'
-    endif
+    " setup accept and cycle shortcuts in the buffer being rendered into
+    call s:fim_map_keys(l:bufnr)
 
     let s:fim_hint_shown = v:true
 
+    " remember where the hint was rendered so teardown targets the same buffer
+    let s:fim_data['bufnr']       = l:bufnr
     let s:fim_data['pos_x']       = l:pos_x
     let s:fim_data['pos_y']       = l:pos_y
 
@@ -1653,8 +1689,16 @@ endfunction
 function! llama#fim_hide()
     let s:fim_hint_shown = v:false
 
-    " clear the virtual text
-    let l:bufnr = bufnr('%')
+    " clear the virtual text from the buffer the hint was rendered in, which is not
+    " necessarily the current one by the time this runs
+    "
+    " fall back to the current buffer when nothing was rendered yet, or when the render
+    " buffer has since been wiped -- clearing an empty namespace there is harmless, while
+    " passing a stale id to nvim_buf_clear_namespace() would throw
+    let l:bufnr = get(s:fim_data, 'bufnr', -1)
+    if l:bufnr <= 0 || !bufexists(l:bufnr)
+        let l:bufnr = bufnr('%')
+    endif
 
     if s:ghost_text_nvim
         let l:id_vt_fim = nvim_create_namespace('vt_fim')
@@ -1669,22 +1713,9 @@ function! llama#fim_hide()
         set statusline=
     endif
 
-    " remove the mappings
-    if g:llama_config.keymap_fim_accept_full != ''
-        exe 'silent! iunmap <buffer> ' . g:llama_config.keymap_fim_accept_full
-    endif
-    if g:llama_config.keymap_fim_accept_line != ''
-        exe 'silent! iunmap <buffer> ' . g:llama_config.keymap_fim_accept_line
-    endif
-    if g:llama_config.keymap_fim_accept_word != ''
-        exe 'silent! iunmap <buffer> ' . g:llama_config.keymap_fim_accept_word
-    endif
-    if g:llama_config.keymap_fim_next != ''
-        exe 'silent! iunmap <buffer> ' . g:llama_config.keymap_fim_next
-    endif
-    if g:llama_config.keymap_fim_prev != ''
-        exe 'silent! iunmap <buffer> ' . g:llama_config.keymap_fim_prev
-    endif
+    " remove the mappings from that same buffer
+    call s:fim_unmap_keys(l:bufnr)
+    let s:fim_data['bufnr'] = -1
 endfunction
 
 " ref: https://github.com/ggml-org/llama.vim/pull/85
