@@ -110,7 +110,16 @@ function! llama_debug#toggle() abort
         return
     endif
 
-    " otherwise, open (or re‑open) the debug pane in a bottom split
+    call llama_debug#show()
+endfunction
+
+function! llama_debug#show() abort
+    " Open (or re-open) the debug pane without closing an already-visible pane.
+    if s:debug.bufnr > 0 && bufexists(s:debug.bufnr) && bufwinnr(s:debug.bufnr) != -1
+        call s:flush_sched()
+        return
+    endif
+
     if s:debug.bufnr > 0 && bufexists(s:debug.bufnr)
         " the buffer already exists – open it in a split without creating a new one
         execute 'botright sbuffer ' . s:debug.bufnr
@@ -136,4 +145,5 @@ function! llama_debug#setup() abort
 
     command! LlamaDebugClear  call llama_debug#clear()
     command! LlamaDebugToggle call llama_debug#toggle()
+    command! -bang LlamaDebugSnapshot call llama#debug_show_snapshot(<bang>0)
 endfunction

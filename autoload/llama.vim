@@ -33,6 +33,8 @@ highlight default llama_hl_fim_info guifg=#77ff2f ctermfg=119
 "   max_line_suffix:  do not auto-trigger FIM completion if there are more than this number of characters to the right of the cursor
 "   max_cache_keys:   max number of cached completions to keep in result_cache
 "   context_providers: list of synchronous functions that return extra FIM context chunks
+"   debug_snapshot_callback: deferred observer for each exact FIM request snapshot
+"   fim_event_callback: deferred observer for request/response/shown/accepted/dismissed/error events
 "   enable_at_startup: enable llama.vim functionality at startup (default: v:true)
 "
 " ring buffer of chunks, accumulated with time upon:
@@ -87,6 +89,8 @@ let s:default_config = {
     \ 'max_cache_keys':         250,
     \ 'context_providers':      [],
     \ 'context_providers_enabled': v:true,
+    \ 'debug_snapshot_callback': '',
+    \ 'fim_event_callback':     '',
     \ 'ring_n_chunks':          16,
     \ 'ring_chunk_size':        64,
     \ 'ring_scope':             1024,
@@ -225,7 +229,7 @@ function! s:rand(i0, i1) abort
 endfunction
 
 function! llama#disable()
-    call llama#fim_hide()
+    call llama#fim_hide('disabled')
 
     autocmd! llama
 
@@ -283,7 +287,7 @@ endfunction
 
 function! llama#toggle_context_providers()
     let g:llama_config.context_providers_enabled = get(g:llama_config, 'context_providers_enabled', v:true) ? v:false : v:true
-    call llama#fim_hide()
+    call llama#fim_hide('context-providers-changed')
     echo 'Llama context providers: ' . (g:llama_config.context_providers_enabled ? 'ON' : 'OFF')
 endfunction
 
@@ -444,6 +448,8 @@ function! llama#init()
     call llama#setup()
 
     let s:fim_data = {}
+    let s:fim_request_id = 0
+    let s:last_fim_snapshot = {}
 
     let s:ring_chunks = [] " current set of chunks used as extra context
     let s:ring_queued = [] " chunks that are queued to be sent for processing
@@ -500,9 +506,9 @@ endfunction
 function! llama#setup_autocmds()
     augroup llama
         autocmd!
-        autocmd InsertLeavePre  * call llama#fim_hide()
+        autocmd InsertLeavePre  * call llama#fim_hide('insert-leave')
 
-        autocmd CompleteChanged * call llama#fim_hide()
+        autocmd CompleteChanged * call llama#fim_hide('completion-menu')
         autocmd CompleteDone    * call s:on_move()
 
         if g:llama_config.auto_fim
@@ -961,6 +967,126 @@ function! s:fim_cache_hash(prefix, middle, suffix, provider_fingerprint)
     return sha256(a:prefix . a:middle . 'Î' . a:suffix . 'Î' . a:provider_fingerprint)
 endfunction
 
+" Return an RFC 3339-like local timestamp. strftime() emits +HHMM, so add the
+" colon expected by ISO 8601 readers without depending on platform-specific
+" %:z support.
+function! s:fim_event_timestamp() abort
+    let l:timestamp = strftime('%Y-%m-%dT%H:%M:%S%z')
+    return substitute(l:timestamp, '\([+-]\d\d\)\(\d\d\)$', '\1:\2', '')
+endfunction
+
+function! s:fim_callback_enabled(Callback) abort
+    return type(a:Callback) == v:t_func
+        \ || (type(a:Callback) == v:t_string && !empty(a:Callback))
+endfunction
+
+function! s:fim_invoke_callback(label, Callback, event) abort
+    try
+        if type(a:Callback) == v:t_func
+            let l:Callback = a:Callback
+        elseif type(a:Callback) == v:t_string && !empty(a:Callback) && exists('*' . a:Callback)
+            let l:Callback = function(a:Callback)
+        else
+            call llama#debug_log(a:label . ' is not callable')
+            return
+        endif
+
+        " Each observer owns its copy. It must not be able to change the last
+        " snapshot, a later observer event, or the request sent to llama-server.
+        call call(l:Callback, [deepcopy(a:event)])
+    catch
+        call llama#debug_log(a:label . ' failed: ' . v:exception)
+    endtry
+endfunction
+
+function! s:fim_schedule_callback(config_key, label, event) abort
+    let l:Callback = get(g:llama_config, a:config_key, '')
+    if !s:fim_callback_enabled(l:Callback)
+        return
+    endif
+
+    let l:event = deepcopy(a:event)
+    " Do not let observers delay starting the asynchronous FIM request. A
+    " callback that performs I/O must still start its own asynchronous job.
+    call timer_start(0, {-> s:fim_invoke_callback(a:label, l:Callback, l:event)})
+endfunction
+
+function! s:fim_emit_event(event) abort
+    let l:event = deepcopy(a:event)
+    let l:event.schema_version = 1
+    if !has_key(l:event, 'timestamp')
+        let l:event.timestamp = s:fim_event_timestamp()
+    endif
+
+    call s:fim_schedule_callback('fim_event_callback', 'fim_event_callback', l:event)
+    if get(l:event, 'event', '') ==# 'request'
+        call s:fim_schedule_callback('debug_snapshot_callback', 'debug_snapshot_callback', l:event)
+    endif
+endfunction
+
+function! s:fim_build_request_snapshot(request, request_id, pos_x, pos_y, provider_chunks, is_auto, prev, use_cache) abort
+    let l:extra_chars = 0
+    for l:chunk in get(a:request, 'input_extra', [])
+        let l:extra_chars += strchars(get(l:chunk, 'text', ''))
+    endfor
+
+    let l:extra_chunks = len(get(a:request, 'input_extra', []))
+    let l:provider_chunks = max([0, a:provider_chunks])
+    let l:ring_extra_chunks = max([0, l:extra_chunks - l:provider_chunks])
+    let l:prefix = get(a:request, 'input_prefix', '')
+    let l:suffix = get(a:request, 'input_suffix', '')
+    let l:prompt = get(a:request, 'prompt', '')
+
+    return {
+        \ 'schema_version': 1,
+        \ 'event': 'request',
+        \ 'request_id': a:request_id,
+        \ 'timestamp': s:fim_event_timestamp(),
+        \ 'buffer': expand('%:p'),
+        \ 'bufnr': bufnr('%'),
+        \ 'filetype': &filetype,
+        \ 'changedtick': b:changedtick,
+        \ 'cursor_line': a:pos_y,
+        \ 'cursor_col': a:pos_x,
+        \ 'cursor_col_byte': a:pos_x,
+        \ 'ring_chunks': len(s:ring_chunks),
+        \ 'ring_queued': len(s:ring_queued),
+        \ 'ring_evictions': s:ring_n_evict,
+        \ 'ring_extra_chunks': l:ring_extra_chunks,
+        \ 'provider_chunks': l:provider_chunks,
+        \ 'extra_chunks': l:extra_chunks,
+        \ 'extra_chars': l:extra_chars,
+        \ 'prefix_lines': count(l:prefix, "\n"),
+        \ 'suffix_lines': count(l:suffix, "\n"),
+        \ 'prompt_chars': strchars(l:prompt),
+        \ 'n_predict': get(a:request, 'n_predict', 0),
+        \ 'tokens_cached': v:null,
+        \ 'input_prefix': l:prefix,
+        \ 'input_suffix': l:suffix,
+        \ 'input_extra': deepcopy(get(a:request, 'input_extra', [])),
+        \ 'prompt': l:prompt,
+        \ 'request': deepcopy(a:request),
+        \ 'flags': {
+        \   'automatic': a:is_auto,
+        \   'speculative': !empty(a:prev),
+        \   'use_cache': a:use_cache,
+        \ },
+        \ }
+endfunction
+
+function! s:fim_public_response(response) abort
+    let l:response = deepcopy(a:response)
+    if type(l:response) == v:t_dict && has_key(l:response, '_llama_request_id')
+        call remove(l:response, '_llama_request_id')
+    endif
+    return l:response
+endfunction
+
+function! s:fim_buffer_path(bufnr) abort
+    let l:name = bufname(a:bufnr)
+    return empty(l:name) ? '' : fnamemodify(l:name, ':p')
+endfunction
+
 " necessary for 'inoremap <expr>'
 function! llama#fim_inline(is_auto, use_cache) abort
     " exit if not enabled
@@ -970,7 +1096,7 @@ function! llama#fim_inline(is_auto, use_cache) abort
 
     " we already have a suggestion displayed - hide it
     if s:fim_hint_shown && !a:is_auto
-        call llama#fim_hide()
+        call llama#fim_hide('manual-trigger')
         return ''
     endif
 
@@ -1138,20 +1264,34 @@ function! llama#fim(pos_x, pos_y, is_auto, prev, use_cache) abort
         endif
     endif
 
+    let s:fim_request_id += 1
+    let l:request_id = s:fim_request_id
+    let l:snapshot = s:fim_build_request_snapshot(
+        \ l:request,
+        \ l:request_id,
+        \ l:pos_x,
+        \ l:pos_y,
+        \ len(l:provider_extra),
+        \ a:is_auto,
+        \ a:prev,
+        \ a:use_cache)
+    let s:last_fim_snapshot = deepcopy(l:snapshot)
+    call s:fim_emit_event(l:snapshot)
+
     " send the request asynchronously
     let l:request_json = json_encode(l:request)
     if s:ghost_text_nvim
         let s:current_job_fim = jobstart(l:curl_command, {
-            \ 'on_stdout': function('s:fim_on_response', [l:hashes]),
-            \ 'on_exit':   function('s:fim_on_exit'),
+            \ 'on_stdout': function('s:fim_on_response', [l:hashes, l:request_id]),
+            \ 'on_exit':   function('s:fim_on_exit', [l:request_id]),
             \ 'stdout_buffered': v:true
             \ })
         call chansend(s:current_job_fim, l:request_json)
         call chanclose(s:current_job_fim, 'stdin')
     elseif s:ghost_text_vim
         let s:current_job_fim = job_start(l:curl_command, {
-            \ 'out_cb':    function('s:fim_on_response', [l:hashes]),
-            \ 'exit_cb':   function('s:fim_on_exit')
+            \ 'out_cb':    function('s:fim_on_response', [l:hashes, l:request_id]),
+            \ 'exit_cb':   function('s:fim_on_exit', [l:request_id])
             \ })
 
         let channel = job_getchannel(s:current_job_fim)
@@ -1179,7 +1319,7 @@ function! llama#fim(pos_x, pos_y, is_auto, prev, use_cache) abort
 endfunction
 
 " callback that processes the FIM result from the server
-function! s:fim_on_response(hashes, job_id, data, event = v:null)
+function! s:fim_on_response(hashes, request_id, job_id, data, event = v:null)
     if s:ghost_text_nvim
         let l:raw = join(a:data, "\n")
     elseif s:ghost_text_vim
@@ -1209,6 +1349,28 @@ function! s:fim_on_response(hashes, job_id, data, event = v:null)
         let l:responses = l:decoded
     endif
 
+    let l:public_responses = deepcopy(l:responses)
+    let l:tokens_cached = !empty(l:public_responses)
+        \ ? get(l:public_responses[0], 'tokens_cached', v:null)
+        \ : v:null
+
+    if get(s:last_fim_snapshot, 'request_id', -1) == a:request_id
+        let s:last_fim_snapshot.tokens_cached = l:tokens_cached
+    endif
+
+    call s:fim_emit_event({
+        \ 'event': 'response',
+        \ 'request_id': a:request_id,
+        \ 'responses': l:public_responses,
+        \ 'tokens_cached': l:tokens_cached,
+        \ })
+
+    " Keep request correlation alongside cached responses. The internal key is
+    " removed from observer payloads and never reaches llama-server.
+    for l:resp in l:responses
+        let l:resp['_llama_request_id'] = a:request_id
+    endfor
+
     " insert each response into the cache ring buffer
     for l:hash in a:hashes
         for l:resp in l:responses
@@ -1228,9 +1390,14 @@ function! s:fim_on_response(hashes, job_id, data, event = v:null)
     endif
 endfunction
 
-function! s:fim_on_exit(job_id, exit_code, event = v:null)
+function! s:fim_on_exit(request_id, job_id, exit_code, event = v:null)
     if a:exit_code != 0
         echom "FIM job failed with exit code: " . a:exit_code
+        call s:fim_emit_event({
+            \ 'event': 'error',
+            \ 'request_id': a:request_id,
+            \ 'exit_code': a:exit_code,
+            \ })
     endif
 
     let s:current_job_fim = v:null
@@ -1239,7 +1406,7 @@ endfunction
 function! s:on_move()
     let s:t_last_move = reltime()
 
-    call llama#fim_hide()
+    call llama#fim_hide('cursor-move')
 
     let l:pos_x = col('.') - 1
     let l:pos_y = line('.')
@@ -1409,6 +1576,7 @@ function! s:fim_render(pos_x, pos_y, responses, selected)
     endif
 
     let l:response = a:responses[a:selected]
+    let l:request_id = get(l:response, '_llama_request_id', 0)
 
     let l:can_accept = v:true
     let l:has_info   = v:false
@@ -1621,6 +1789,23 @@ function! s:fim_render(pos_x, pos_y, responses, selected)
     let s:fim_data['content']     = l:content
     let s:fim_data['responses']   = a:responses
     let s:fim_data['selected']    = a:selected
+    let s:fim_data['request_id']  = l:request_id
+
+    call s:fim_emit_event({
+        \ 'event': 'shown',
+        \ 'request_id': l:request_id,
+        \ 'buffer': s:fim_buffer_path(l:bufnr),
+        \ 'bufnr': l:bufnr,
+        \ 'cursor_line': l:pos_y,
+        \ 'cursor_col': l:pos_x,
+        \ 'selected': a:selected,
+        \ 'response_count': len(a:responses),
+        \ 'can_accept': l:can_accept,
+        \ 'content': deepcopy(l:content),
+        \ 'tokens_cached': l:n_cached,
+        \ 'truncated': l:truncated,
+        \ 'response': s:fim_public_response(l:response),
+        \ })
 endfunction
 
 " if accept_type == 'full', accept entire response
@@ -1636,8 +1821,24 @@ function! llama#fim_accept(accept_type)
     let l:can_accept = s:fim_data['can_accept']
     let l:content    = s:fim_data['content']
     let l:advance_to_next_line = v:false
+    let l:did_accept = v:false
+    let l:accepted_text = ''
+
+    " fim_render() appends the existing line suffix to the final displayed
+    " completion line. Remove it from observer data so accepted_text describes
+    " only what llama.vim contributed.
+    let l:suggested_content = copy(l:content)
+    let l:line_suffix = strpart(l:line_cur, l:pos_x)
+    if !empty(l:line_suffix) && !empty(l:suggested_content)
+        let l:last = l:suggested_content[-1]
+        let l:suffix_start = strlen(l:last) - strlen(l:line_suffix)
+        if l:suffix_start >= 0 && strpart(l:last, l:suffix_start) ==# l:line_suffix
+            let l:suggested_content[-1] = strpart(l:last, 0, l:suffix_start)
+        endif
+    endif
 
     if l:can_accept && len(l:content) > 0
+        let l:did_accept = v:true
         " insert suggestion on current line
         if a:accept_type != 'word'
             " insert first line of suggestion
@@ -1653,6 +1854,14 @@ function! llama#fim_accept(accept_type)
             let l:remaining = strpart(l:suggested, strlen(l:word))
             let l:advance_to_next_line = !empty(l:word) && l:remaining =~# '^\s*$' && len(l:content) > 1
             call setline(l:pos_y, l:line_cur[:(l:pos_x - 1)] . l:word . l:suffix)
+        endif
+
+        if a:accept_type ==# 'word'
+            let l:accepted_text = l:word
+        elseif a:accept_type ==# 'line'
+            let l:accepted_text = get(l:suggested_content, 0, '') . "\n"
+        else
+            let l:accepted_text = join(l:suggested_content, "\n")
         endif
 
         " insert rest of suggestion
@@ -1681,12 +1890,33 @@ function! llama#fim_accept(accept_type)
             " move cursor for multi-line suggestion
             call cursor(l:pos_y + len(l:content) - 1, len(l:content[-1]) + 1)
         endif
+
+        let l:selected = get(s:fim_data, 'selected', 0)
+        let l:responses = get(s:fim_data, 'responses', [])
+        let l:response = {}
+        if l:selected >= 0 && l:selected < len(l:responses)
+            let l:response = s:fim_public_response(l:responses[l:selected])
+        endif
+        let l:event_bufnr = get(s:fim_data, 'bufnr', bufnr('%'))
+        call s:fim_emit_event({
+            \ 'event': 'accepted',
+            \ 'request_id': get(s:fim_data, 'request_id', 0),
+            \ 'buffer': s:fim_buffer_path(l:event_bufnr),
+            \ 'bufnr': l:event_bufnr,
+            \ 'cursor_line': l:pos_y,
+            \ 'cursor_col': l:pos_x,
+            \ 'accept_type': a:accept_type,
+            \ 'accepted_text': l:accepted_text,
+            \ 'accepted_chars': strchars(l:accepted_text),
+            \ 'response': l:response,
+            \ })
     endif
 
-    call llama#fim_hide()
+    call llama#fim_hide(l:did_accept ? 'accepted' : 'not-acceptable')
 endfunction
 
-function! llama#fim_hide()
+function! llama#fim_hide(reason = 'dismissed')
+    let l:was_shown = s:fim_hint_shown
     let s:fim_hint_shown = v:false
 
     " clear the virtual text from the buffer the hint was rendered in, which is not
@@ -1715,6 +1945,20 @@ function! llama#fim_hide()
 
     " remove the mappings from that same buffer
     call s:fim_unmap_keys(l:bufnr)
+
+    if l:was_shown && a:reason !=# 'accepted'
+        call s:fim_emit_event({
+            \ 'event': 'dismissed',
+            \ 'request_id': get(s:fim_data, 'request_id', 0),
+            \ 'buffer': s:fim_buffer_path(l:bufnr),
+            \ 'bufnr': l:bufnr,
+            \ 'cursor_line': get(s:fim_data, 'pos_y', 0),
+            \ 'cursor_col': get(s:fim_data, 'pos_x', 0),
+            \ 'reason': a:reason,
+            \ 'content': deepcopy(get(s:fim_data, 'content', [])),
+            \ })
+    endif
+
     let s:fim_data['bufnr'] = -1
 endfunction
 
@@ -2286,6 +2530,66 @@ endfunction
 " =====================================
 " Debug helpers
 " =====================================
+
+function! llama#debug_snapshot() abort
+    if !exists('s:last_fim_snapshot') || empty(s:last_fim_snapshot)
+        return {}
+    endif
+    return deepcopy(s:last_fim_snapshot)
+endfunction
+
+function! llama#debug_show_snapshot(include_full = v:false) abort
+    let l:snapshot = llama#debug_snapshot()
+    if empty(l:snapshot)
+        call llama#debug_log('FIM snapshot', ['No FIM request has been sent yet.'])
+        call llama_debug#show()
+        return {}
+    endif
+
+    let l:lines = [
+        \ printf('request #%d | %s', get(l:snapshot, 'request_id', 0), get(l:snapshot, 'timestamp', '')),
+        \ printf('buffer: %s:%d:%d', get(l:snapshot, 'buffer', ''), get(l:snapshot, 'cursor_line', 0), get(l:snapshot, 'cursor_col', 0)),
+        \ printf('ring: active=%d request=%d queued=%d evictions=%d providers=%d',
+        \   get(l:snapshot, 'ring_chunks', 0),
+        \   get(l:snapshot, 'ring_extra_chunks', 0),
+        \   get(l:snapshot, 'ring_queued', 0),
+        \   get(l:snapshot, 'ring_evictions', 0),
+        \   get(l:snapshot, 'provider_chunks', 0)),
+        \ printf('context: prefix_lines=%d suffix_lines=%d prompt_chars=%d extra_chunks=%d extra_chars=%d',
+        \   get(l:snapshot, 'prefix_lines', 0),
+        \   get(l:snapshot, 'suffix_lines', 0),
+        \   get(l:snapshot, 'prompt_chars', 0),
+        \   get(l:snapshot, 'extra_chunks', 0),
+        \   get(l:snapshot, 'extra_chars', 0)),
+        \ printf('generation: n_predict=%d tokens_cached=%s',
+        \   get(l:snapshot, 'n_predict', 0),
+        \   string(get(l:snapshot, 'tokens_cached', v:null))),
+        \ 'chunks:',
+        \ ]
+
+    let l:index = 0
+    for l:chunk in get(l:snapshot, 'input_extra', [])
+        let l:index += 1
+        call add(l:lines, printf('  %d. %s (%d chars)',
+            \ l:index,
+            \ get(l:chunk, 'filename', 'context'),
+            \ strchars(get(l:chunk, 'text', ''))))
+    endfor
+    if l:index == 0
+        call add(l:lines, '  (none)')
+    endif
+
+    if a:include_full
+        call add(l:lines, 'full snapshot JSON:')
+        call add(l:lines, json_encode(l:snapshot))
+    else
+        call add(l:lines, 'Use :LlamaDebugSnapshot! to include full JSON.')
+    endif
+
+    call llama#debug_log('FIM snapshot', l:lines)
+    call llama_debug#show()
+    return l:snapshot
+endfunction
 
 function! llama#debug_log(msg, ...) abort
     return call('llama_debug#log', [a:msg] + a:000)

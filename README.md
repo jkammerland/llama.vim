@@ -159,6 +159,15 @@ Here are recommended settings, depending on the amount of VRAM that you have:
 
 Use `:help llama` for more details.
 
+### Inspecting FIM context
+
+`:LlamaDebugSnapshot` opens a readable summary of the last exact FIM request;
+`:LlamaDebugSnapshot!` also includes its full JSON. For external monitors, set
+`debug_snapshot_callback` to observe request snapshots or `fim_event_callback`
+to observe the correlated request, response, display, acceptance, dismissal,
+and error lifecycle. Observers are deferred, receive deep copies, and cannot
+mutate the request sent to `llama-server`.
+
 ### Recommended LLMs
 
 The plugin requires FIM-compatible models: [HF collection](https://huggingface.co/collections/ggml-org/llamavim-6720fece33898ac10544ecf9)

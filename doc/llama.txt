@@ -63,6 +63,11 @@ Commands
 		Toggle the debug pane.
 		Equivalent to vimscript function: `debug#toggle()`
 
+*:LlamaDebugSnapshot*
+		Show a summary of the last exact FIM request in the debug pane.
+		Use :LlamaDebugSnapshot! to include the full untruncated JSON snapshot.
+		Equivalent to vimscript function: `llama#debug_show_snapshot()`
+
 ================================================================================
 How to start the server
 
@@ -126,6 +131,8 @@ Currently the default config is:
 		    \ 'max_cache_keys':         250,
 		    \ 'context_providers':      [],
 		    \ 'context_providers_enabled': v:true,
+		    \ 'debug_snapshot_callback': '',
+		    \ 'fim_event_callback':     '',
 		    \ 'ring_n_chunks':          16,
 		    \ 'ring_chunk_size':        64,
 		    \ 'ring_scope':             1024,
@@ -251,6 +258,34 @@ Currently the default config is:
 						config.context_providers_enabled = false
 						vim.g.llama_config = config
 <
+
+- {debug_snapshot_callback}	function or function-name string called with the
+						exact, untruncated request snapshot for every FIM request.
+						The snapshot includes the request body, local prefix/suffix,
+						prompt, extra chunks, cursor and buffer metadata, and ring/provider
+						statistics. It is disabled by default.
+
+- {fim_event_callback}		function or function-name string called for versioned
+						`request`, `response`, `shown`, `accepted`, `dismissed`, and
+						`error` dictionaries. `request_id` correlates the lifecycle.
+						Callbacks run from a zero-delay timer and receive deep copies;
+						they should start asynchronous work rather than waiting for I/O.
+						Callback errors are written to the debug log and do not stop FIM.
+
+						In Neovim Lua, callbacks may be assigned directly:
+>lua
+						local config = vim.g.llama_config
+						config.fim_event_callback = function(event)
+						  vim.schedule(function()
+						    require('my_monitor').record(event)
+						  end)
+						end
+						vim.g.llama_config = config
+<
+
+						`llama#debug_snapshot()` returns a deep copy of the latest request
+						without firing either callback. Once the matching response arrives,
+						its `tokens_cached` value enriches the stored snapshot.
 
 - {enable_at_startup}	whether to enable llama.vim functionality at startup
 						(v:true to enable, v:false to disable; default: v:true)
