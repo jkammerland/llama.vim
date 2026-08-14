@@ -142,6 +142,14 @@ endfor
 
 let g:llama_config = extendnew(s:default_config, llama_config, 'force')
 
+" Lifecycle observers registered through the public API are independent of the
+" legacy single callback in g:llama_config. Keep this registry outside
+" llama#init() so observers survive disable/enable cycles.
+let s:fim_observers = {}
+let s:fim_observer_id = 0
+let s:fim_pending_callbacks = {}
+let s:fim_pending_callback_id = 0
+
 let s:llama_enabled = v:false
 
 " containes cached responses from the server
@@ -232,6 +240,7 @@ endfunction
 
 function! llama#disable()
     call llama#fim_hide('disabled')
+    call llama#debug_snapshot_clear()
 
     autocmd! llama
 
@@ -503,6 +512,10 @@ function! llama#init()
     if g:llama_config.enable_at_startup
         call llama#enable()
     endif
+
+    " Integrations can register only after the autoload API exists. This event
+    " also gives late-loaded consumers a deterministic readiness handshake.
+    silent! doautocmd <nomodeline> User LlamaReady
 endfunction
 
 function! llama#setup_autocmds()
@@ -983,7 +996,8 @@ function! s:fim_callback_enabled(Callback) abort
 endfunction
 
 function! s:fim_lifecycle_observer_enabled() abort
-    return s:fim_callback_enabled(get(g:llama_config, 'fim_event_callback', ''))
+    return !empty(s:fim_observers)
+        \ || s:fim_callback_enabled(get(g:llama_config, 'fim_event_callback', ''))
 endfunction
 
 function! s:fim_request_snapshot_enabled() abort
@@ -1011,21 +1025,80 @@ function! s:fim_invoke_callback(label, Callback, event) abort
     endtry
 endfunction
 
-function! s:fim_schedule_callback(config_key, label, event) abort
-    let l:Callback = get(g:llama_config, a:config_key, '')
-    if !s:fim_callback_enabled(l:Callback)
+function! s:fim_invoke_pending_callback(pending_id, timer_id) abort
+    let l:key = string(a:pending_id)
+    if !has_key(s:fim_pending_callbacks, l:key)
+        return
+    endif
+    let l:pending = remove(s:fim_pending_callbacks, l:key)
+    call s:fim_invoke_callback(
+        \ l:pending.label,
+        \ l:pending.Callback,
+        \ l:pending.event)
+endfunction
+
+function! s:fim_schedule_observer(label, Callback, event) abort
+    if !s:fim_callback_enabled(a:Callback)
         return
     endif
 
-    let l:event = deepcopy(a:event)
     " Do not let observers delay starting the asynchronous FIM request. A
     " callback that performs I/O must still start its own asynchronous job.
-    call timer_start(0, {-> s:fim_invoke_callback(a:label, l:Callback, l:event)})
+    " Keep an explicit pending reference so removing a registry entry or
+    " replacing a configured callback cannot invalidate an event that was
+    " already dispatched.
+    let s:fim_pending_callback_id += 1
+    let l:pending_id = s:fim_pending_callback_id
+    let s:fim_pending_callbacks[l:pending_id] = {
+        \ 'label': a:label,
+        \ 'Callback': a:Callback,
+        \ 'event': deepcopy(a:event),
+        \ }
+    call timer_start(0, function('s:fim_invoke_pending_callback', [l:pending_id]))
+endfunction
+
+function! s:fim_schedule_callback(config_key, label, event) abort
+    call s:fim_schedule_observer(
+        \ a:label,
+        \ get(g:llama_config, a:config_key, ''),
+        \ a:event)
+endfunction
+
+function! llama#fim_observer_add(Callback) abort
+    if !s:fim_callback_enabled(a:Callback)
+        throw 'llama.vim: FIM observer must be a function or function-name string'
+    endif
+    let s:fim_observer_id += 1
+    let s:fim_observers[s:fim_observer_id] = a:Callback
+    return s:fim_observer_id
+endfunction
+
+function! llama#fim_observer_remove(observer_id) abort
+    let l:key = string(a:observer_id)
+    if !has_key(s:fim_observers, l:key)
+        return v:false
+    endif
+    call remove(s:fim_observers, l:key)
+    if !s:fim_request_snapshot_enabled()
+        call llama#debug_snapshot_clear()
+    endif
+    return v:true
+endfunction
+
+function! llama#fim_observer_has(observer_id) abort
+    return has_key(s:fim_observers, string(a:observer_id))
 endfunction
 
 function! s:fim_emit_event(event) abort
     let l:kind = get(a:event, 'event', '')
-    let l:lifecycle_enabled = s:fim_lifecycle_observer_enabled()
+    let l:config_lifecycle_enabled = s:fim_callback_enabled(
+        \ get(g:llama_config, 'fim_event_callback', ''))
+    " items() captures this event's subscribers before any zero-delay timer
+    " runs. Removing an observer affects future events, not an event already
+    " emitted into the dispatcher.
+    let l:registered_observers = items(copy(s:fim_observers))
+    let l:lifecycle_enabled = l:config_lifecycle_enabled
+        \ || !empty(l:registered_observers)
     let l:snapshot_enabled = l:kind ==# 'request'
         \ && s:fim_callback_enabled(get(g:llama_config, 'debug_snapshot_callback', ''))
     if !l:lifecycle_enabled && !l:snapshot_enabled
@@ -1038,9 +1111,15 @@ function! s:fim_emit_event(event) abort
         let l:event.timestamp = s:fim_event_timestamp()
     endif
 
-    if l:lifecycle_enabled
+    if l:config_lifecycle_enabled
         call s:fim_schedule_callback('fim_event_callback', 'fim_event_callback', l:event)
     endif
+    for [l:observer_id, l:Callback] in l:registered_observers
+        call s:fim_schedule_observer(
+            \ 'registered FIM observer #' . l:observer_id,
+            \ l:Callback,
+            \ l:event)
+    endfor
     if l:snapshot_enabled
         call s:fim_schedule_callback('debug_snapshot_callback', 'debug_snapshot_callback', l:event)
     endif
@@ -1396,13 +1475,13 @@ function! s:fim_on_response(hashes, request_id, job_id, data, event = v:null)
             \ })
     endif
 
-    if l:observe_lifecycle
-        " Keep request correlation alongside cached responses. The internal key
-        " is removed from observer payloads and never reaches llama-server.
-        for l:resp in l:responses
-            let l:resp['_llama_request_id'] = a:request_id
-        endfor
-    endif
+    " Keep cheap scalar correlation alongside every cached response, including
+    " completions produced while no lifecycle observer is active. Snapshot
+    " construction and response payload copies remain gated. The internal key
+    " is removed from observer payloads and never reaches llama-server.
+    for l:resp in l:responses
+        let l:resp['_llama_request_id'] = a:request_id
+    endfor
 
     " insert each response into the cache ring buffer
     for l:hash in a:hashes
@@ -2575,7 +2654,15 @@ endfunction
 " Debug helpers
 " =====================================
 
+function! llama#debug_snapshot_clear() abort
+    let s:last_fim_snapshot = {}
+    return {}
+endfunction
+
 function! llama#debug_snapshot() abort
+    if !s:fim_request_snapshot_enabled()
+        return llama#debug_snapshot_clear()
+    endif
     if !exists('s:last_fim_snapshot') || empty(s:last_fim_snapshot)
         return {}
     endif

@@ -146,4 +146,5 @@ function! llama_debug#setup() abort
     command! LlamaDebugClear  call llama_debug#clear()
     command! LlamaDebugToggle call llama_debug#toggle()
     command! -bang LlamaDebugSnapshot call llama#debug_show_snapshot(<bang>0)
+    command! LlamaDebugSnapshotClear call llama#debug_snapshot_clear()
 endfunction

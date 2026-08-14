@@ -68,6 +68,10 @@ Commands
 		Use :LlamaDebugSnapshot! to include the full untruncated JSON snapshot.
 		Equivalent to vimscript function: `llama#debug_show_snapshot()`
 
+*:LlamaDebugSnapshotClear*
+		Release the retained FIM request snapshot immediately.
+		Equivalent to vimscript function: `llama#debug_snapshot_clear()`
+
 ================================================================================
 How to start the server
 
@@ -278,8 +282,10 @@ Currently the default config is:
 						they should start asynchronous work rather than waiting for I/O.
 						Callback errors are written to the debug log and do not stop FIM.
 						When this callback, {debug_snapshot_callback}, and
-						{debug_snapshot_enabled} are all disabled, request snapshots and
-						lifecycle payload copies are not constructed.
+						{debug_snapshot_enabled} are all disabled and no registered
+						observers remain, request snapshots and lifecycle payload copies
+						are not constructed. Cached responses retain only an internal
+						scalar request ID so later display/acceptance stays correlated.
 
 						In Neovim Lua, callbacks may be assigned directly:
 >lua
@@ -292,9 +298,25 @@ Currently the default config is:
 						vim.g.llama_config = config
 <
 
+						Independent integrations should register without replacing the
+						single configured callback:
+>vim
+						let s:observer = llama#fim_observer_add(function('MyFimObserver'))
+						" Later:
+						call llama#fim_observer_remove(s:observer)
+<
+						`llama#fim_observer_has(id)` reports whether a handle remains
+						registered. Subscriptions are event-scoped: an observer receives
+						only lifecycle events dispatched while it is registered, so an
+						observer added during an in-flight request can see a partial
+						lifecycle while retaining the correct nonzero `request_id`.
+
 						`llama#debug_snapshot()` returns a deep copy of the latest request
 						without firing either callback. Once the matching response arrives,
-						its `tokens_cached` value enriches the stored snapshot.
+						its `tokens_cached` value enriches the stored snapshot. Removing the
+						last registered observer releases the snapshot when no other capture
+						option is active. `llama#disable()` and
+						`llama#debug_snapshot_clear()` also release it immediately.
 
 - {enable_at_startup}	whether to enable llama.vim functionality at startup
 						(v:true to enable, v:false to disable; default: v:true)

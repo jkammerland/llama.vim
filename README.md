@@ -163,12 +163,17 @@ Use `:help llama` for more details.
 
 Set `debug_snapshot_enabled` to retain requests for manual inspection.
 `:LlamaDebugSnapshot` then opens a readable summary of the last exact FIM request;
-`:LlamaDebugSnapshot!` also includes its full JSON. For external monitors, set
+`:LlamaDebugSnapshot!` also includes its full JSON, and
+`:LlamaDebugSnapshotClear` releases it. For external monitors, set
 `debug_snapshot_callback` to observe request snapshots or `fim_event_callback`
 to observe the correlated request, response, display, acceptance, dismissal,
-and error lifecycle. Observers are deferred, receive deep copies, and cannot
-mutate the request sent to `llama-server`. With capture disabled and both
-callbacks empty, snapshot construction and lifecycle payload copies are skipped.
+and error lifecycle. Independent integrations should use
+`llama#fim_observer_add()` and remove the returned handle with
+`llama#fim_observer_remove()`. Observers are event-scoped and deferred, receive
+deep copies, and cannot mutate the request sent to `llama-server`. With capture
+disabled and no configured or registered observers, snapshot construction and
+lifecycle payload copies are skipped; cached responses retain only a small
+internal request ID for later correlation.
 
 ### Recommended LLMs
 

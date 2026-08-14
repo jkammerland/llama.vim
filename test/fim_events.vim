@@ -19,6 +19,7 @@ let $PATH = s:curl_dir . ':' . s:old_path
 let s:events = []
 let s:snapshots = []
 let s:string_callback_count = 0
+let s:registered_events = []
 
 function! s:on_event(event) abort
     call add(s:events, deepcopy(a:event))
@@ -33,6 +34,10 @@ endfunction
 
 function! s:broken_callback(event) abort
     throw 'observer failure'
+endfunction
+
+function! s:on_registered_event(event) abort
+    call add(s:registered_events, deepcopy(a:event))
 endfunction
 
 function! LlamaTestStringCallback(event) abort
@@ -65,6 +70,20 @@ function! s:request_count() abort
     return filereadable(s:request_file) ? len(readfile(s:request_file)) : 0
 endfunction
 
+function! s:wait(timeout, Condition, interval) abort
+    if exists('*wait')
+        return wait(a:timeout, a:Condition, a:interval)
+    endif
+    let l:start = reltime()
+    while reltimefloat(reltime(l:start)) * 1000.0 < a:timeout
+        if call(a:Condition, [])
+            return 0
+        endif
+        execute 'sleep ' . a:interval . 'm'
+    endwhile
+    return -1
+endfunction
+
 function! s:event_count(kind) abort
     return len(filter(copy(s:events), 'get(v:val, "event", "") ==# a:kind'))
 endfunction
@@ -74,9 +93,23 @@ function! s:last_event(kind) abort
     return empty(l:matches) ? {} : l:matches[-1]
 endfunction
 
+function! s:max_cached_request_id() abort
+    let l:maximum = 0
+    for l:entries in values(g:cache_data)
+        for l:response in l:entries
+            let l:maximum = max([l:maximum, get(l:response, '_llama_request_id', 0)])
+        endfor
+    endfor
+    return l:maximum
+endfunction
+
+function! s:registered_event_count(kind) abort
+    return len(filter(copy(s:registered_events), 'get(v:val, "event", "") ==# a:kind'))
+endfunction
+
 call llama#fim(-1, -1, v:false, [], v:false)
-call assert_equal(0, wait(2000, {-> s:request_count() >= 1}, 20), 'FIM request was not captured')
-call assert_equal(0, wait(2000, {-> s:event_count('response') >= 1 && len(s:snapshots) >= 1}, 20), 'observer callbacks did not finish')
+call assert_equal(0, s:wait(2000, {-> s:request_count() >= 1}, 20), 'FIM request was not captured')
+call assert_equal(0, s:wait(2000, {-> s:event_count('response') >= 1 && len(s:snapshots) >= 1}, 20), 'observer callbacks did not finish')
 
 let s:server_request = json_decode(readfile(s:request_file)[0])
 let s:request_event = s:last_event('request')
@@ -111,14 +144,33 @@ call assert_equal(s:snapshot_count_before_manual, len(s:snapshots), 'manual snap
 let g:llama_config.fim_event_callback = function('s:broken_callback')
 call setline(2, 'value = 2;')
 call llama#fim(-1, -1, v:false, [], v:false)
-call assert_equal(0, wait(2000, {-> s:request_count() >= 2}, 20), 'throwing callback blocked FIM')
+call assert_equal(0, s:wait(2000, {-> s:request_count() >= 2}, 20), 'throwing callback blocked FIM')
 
 " Function-name strings remain supported for Vim configuration files.
 let g:llama_config.fim_event_callback = 'LlamaTestStringCallback'
 call setline(2, 'value = 3;')
 call llama#fim(-1, -1, v:false, [], v:false)
-call assert_equal(0, wait(2000, {-> s:request_count() >= 3}, 20), 'string callback request was not sent')
-call assert_equal(0, wait(2000, {-> s:string_callback_count >= 2}, 20), 'string callback did not receive request and response')
+call assert_equal(0, s:wait(2000, {-> s:request_count() >= 3}, 20), 'string callback request was not sent')
+call assert_equal(0, s:wait(2000, {-> s:string_callback_count >= 2}, 20), 'string callback did not receive request and response')
+
+" Registered observers coexist with the legacy callback and can be removed
+" without waiting for another FIM request. An event emitted before removal is
+" still delivered, while later lifecycle events are not.
+let g:llama_config.fim_event_callback = ''
+let g:llama_config.debug_snapshot_callback = ''
+let g:llama_config.debug_snapshot_enabled = v:false
+let s:observer_id = llama#fim_observer_add(function('s:on_registered_event'))
+call assert_true(llama#fim_observer_has(s:observer_id))
+call setline(2, 'value = 4;')
+call llama#fim(-1, -1, v:false, [], v:false)
+call assert_equal(0, s:wait(2000, {-> s:request_count() >= 4}, 20), 'registered observer request was not sent')
+call assert_equal(0, s:wait(2000, {-> s:registered_event_count('request') >= 1 && s:registered_event_count('response') >= 1}, 20), 'registered observer did not receive request and response')
+call assert_true(llama#fim_observer_remove(s:observer_id))
+call assert_false(llama#fim_observer_has(s:observer_id))
+call assert_equal({}, llama#debug_snapshot(), 'observer removal retained a request snapshot')
+call assert_equal(0, s:wait(2000, {-> s:max_cached_request_id() >= 4}, 20), 'disabled response was not correlated in cache')
+sleep 20m
+call assert_equal(2, len(s:registered_events), 'registered observer received an unexpected lifecycle event')
 
 " Render/accept/dismiss events are correlated without exposing the internal
 " response metadata added to cache entries.
@@ -129,13 +181,17 @@ call assert_notequal('', s:render_function, 'could not find FIM renderer')
 enew!
 call setline(1, 'prefix')
 call cursor(1, 6)
+let s:shown_observer_id = llama#fim_observer_add(function('s:on_registered_event'))
 execute printf('call %s(6, 1, [%s], 0)', s:render_function, string({
     \ 'content': ' answer',
     \ 'tokens_cached': 9,
     \ '_llama_request_id': 77,
     \ }))
+call assert_true(llama#fim_observer_remove(s:shown_observer_id))
 call llama#fim_accept('full')
-call assert_equal(0, wait(1000, {-> s:event_count('accepted') >= 1}, 10), 'accepted event was not delivered')
+call assert_equal(0, s:wait(1000, {-> s:event_count('accepted') >= 1}, 10), 'accepted event was not delivered')
+call assert_equal(0, s:wait(1000, {-> s:registered_event_count('shown') >= 1}, 10), 'dispatched event was lost during observer removal')
+call assert_equal(0, s:registered_event_count('accepted'), 'removed observer received a later event')
 let s:accepted = s:last_event('accepted')
 call assert_equal(77, s:accepted.request_id)
 call assert_equal('full', s:accepted.accept_type)
@@ -148,7 +204,7 @@ execute printf('call %s(13, 1, [%s], 0)', s:render_function, string({
     \ '_llama_request_id': 78,
     \ }))
 call llama#fim_hide('test-dismiss')
-call assert_equal(0, wait(1000, {-> s:event_count('dismissed') >= 1}, 10), 'dismissed event was not delivered')
+call assert_equal(0, s:wait(1000, {-> s:event_count('dismissed') >= 1}, 10), 'dismissed event was not delivered')
 call assert_equal('test-dismiss', s:last_event('dismissed').reason)
 call assert_equal(78, s:last_event('dismissed').request_id)
 
@@ -162,7 +218,7 @@ let g:llama_config.debug_snapshot_enabled = v:false
 call setline(1, 'capture disabled')
 call cursor(1, 8)
 call llama#fim(-1, -1, v:false, [], v:false)
-call assert_equal(0, wait(2000, {-> s:request_count() >= 4}, 20), 'disabled observer request was not sent')
+call assert_equal(0, s:wait(2000, {-> s:request_count() >= 5}, 20), 'disabled observer request was not sent')
 call assert_equal({}, llama#debug_snapshot(), 'disabled capture retained a request snapshot')
 sleep 20m
 call assert_equal(s:event_count_before_disabled, len(s:events), 'disabled lifecycle callback received an event')
@@ -172,13 +228,14 @@ call assert_equal(s:snapshot_count_before_disabled, len(s:snapshots), 'disabled 
 let g:llama_config.debug_snapshot_enabled = v:true
 call setline(1, 'manual capture')
 call llama#fim(-1, -1, v:false, [], v:false)
-call assert_equal(0, wait(2000, {-> s:request_count() >= 5}, 20), 'manual capture request was not sent')
-call assert_equal(0, wait(2000, {-> get(llama#debug_snapshot(), 'tokens_cached', v:null) is 17}, 20), 'manual snapshot was not enriched')
+call assert_equal(0, s:wait(2000, {-> s:request_count() >= 6}, 20), 'manual capture request was not sent')
+call assert_equal(0, s:wait(2000, {-> get(llama#debug_snapshot(), 'tokens_cached', v:null) is 17}, 20), 'manual snapshot was not enriched')
 call assert_equal('request', get(llama#debug_snapshot(), 'event', ''), 'manual capture did not retain the request')
 call assert_equal(s:event_count_before_disabled, len(s:events), 'manual capture emitted a lifecycle event')
 call assert_equal(s:snapshot_count_before_disabled, len(s:snapshots), 'manual capture invoked a snapshot callback')
 
 call llama#disable()
+call assert_equal({}, llama#debug_snapshot(), 'disabling llama.vim retained a request snapshot')
 let $PATH = s:old_path
 call delete(s:tmpdir, 'rf')
 delfunction LlamaTestStringCallback
