@@ -161,12 +161,14 @@ Use `:help llama` for more details.
 
 ### Inspecting FIM context
 
-`:LlamaDebugSnapshot` opens a readable summary of the last exact FIM request;
+Set `debug_snapshot_enabled` to retain requests for manual inspection.
+`:LlamaDebugSnapshot` then opens a readable summary of the last exact FIM request;
 `:LlamaDebugSnapshot!` also includes its full JSON. For external monitors, set
 `debug_snapshot_callback` to observe request snapshots or `fim_event_callback`
 to observe the correlated request, response, display, acceptance, dismissal,
 and error lifecycle. Observers are deferred, receive deep copies, and cannot
-mutate the request sent to `llama-server`.
+mutate the request sent to `llama-server`. With capture disabled and both
+callbacks empty, snapshot construction and lifecycle payload copies are skipped.
 
 ### Recommended LLMs
 

@@ -152,6 +152,32 @@ call assert_equal(0, wait(1000, {-> s:event_count('dismissed') >= 1}, 10), 'dism
 call assert_equal('test-dismiss', s:last_event('dismissed').reason)
 call assert_equal(78, s:last_event('dismissed').request_id)
 
+" With every observer disabled, request capture must be gated off rather than
+" merely constructing a payload that nobody consumes.
+let s:event_count_before_disabled = len(s:events)
+let s:snapshot_count_before_disabled = len(s:snapshots)
+let g:llama_config.fim_event_callback = ''
+let g:llama_config.debug_snapshot_callback = ''
+let g:llama_config.debug_snapshot_enabled = v:false
+call setline(1, 'capture disabled')
+call cursor(1, 8)
+call llama#fim(-1, -1, v:false, [], v:false)
+call assert_equal(0, wait(2000, {-> s:request_count() >= 4}, 20), 'disabled observer request was not sent')
+call assert_equal({}, llama#debug_snapshot(), 'disabled capture retained a request snapshot')
+sleep 20m
+call assert_equal(s:event_count_before_disabled, len(s:events), 'disabled lifecycle callback received an event')
+call assert_equal(s:snapshot_count_before_disabled, len(s:snapshots), 'disabled snapshot callback received an event')
+
+" Explicit manual capture remains available without installing a callback.
+let g:llama_config.debug_snapshot_enabled = v:true
+call setline(1, 'manual capture')
+call llama#fim(-1, -1, v:false, [], v:false)
+call assert_equal(0, wait(2000, {-> s:request_count() >= 5}, 20), 'manual capture request was not sent')
+call assert_equal(0, wait(2000, {-> get(llama#debug_snapshot(), 'tokens_cached', v:null) is 17}, 20), 'manual snapshot was not enriched')
+call assert_equal('request', get(llama#debug_snapshot(), 'event', ''), 'manual capture did not retain the request')
+call assert_equal(s:event_count_before_disabled, len(s:events), 'manual capture emitted a lifecycle event')
+call assert_equal(s:snapshot_count_before_disabled, len(s:snapshots), 'manual capture invoked a snapshot callback')
+
 call llama#disable()
 let $PATH = s:old_path
 call delete(s:tmpdir, 'rf')

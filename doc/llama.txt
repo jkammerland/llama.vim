@@ -131,6 +131,7 @@ Currently the default config is:
 		    \ 'max_cache_keys':         250,
 		    \ 'context_providers':      [],
 		    \ 'context_providers_enabled': v:true,
+		    \ 'debug_snapshot_enabled': v:false,
 		    \ 'debug_snapshot_callback': '',
 		    \ 'fim_event_callback':     '',
 		    \ 'ring_n_chunks':          16,
@@ -259,6 +260,11 @@ Currently the default config is:
 						vim.g.llama_config = config
 <
 
+- {debug_snapshot_enabled}	whether to retain the latest exact FIM request for
+						manual `llama#debug_snapshot()` / `:LlamaDebugSnapshot`
+						inspection. Disabled by default. Active callbacks enable capture
+						for their own requests without changing this setting.
+
 - {debug_snapshot_callback}	function or function-name string called with the
 						exact, untruncated request snapshot for every FIM request.
 						The snapshot includes the request body, local prefix/suffix,
@@ -271,6 +277,9 @@ Currently the default config is:
 						Callbacks run from a zero-delay timer and receive deep copies;
 						they should start asynchronous work rather than waiting for I/O.
 						Callback errors are written to the debug log and do not stop FIM.
+						When this callback, {debug_snapshot_callback}, and
+						{debug_snapshot_enabled} are all disabled, request snapshots and
+						lifecycle payload copies are not constructed.
 
 						In Neovim Lua, callbacks may be assigned directly:
 >lua

@@ -33,6 +33,7 @@ highlight default llama_hl_fim_info guifg=#77ff2f ctermfg=119
 "   max_line_suffix:  do not auto-trigger FIM completion if there are more than this number of characters to the right of the cursor
 "   max_cache_keys:   max number of cached completions to keep in result_cache
 "   context_providers: list of synchronous functions that return extra FIM context chunks
+"   debug_snapshot_enabled: retain the latest request for manual inspection
 "   debug_snapshot_callback: deferred observer for each exact FIM request snapshot
 "   fim_event_callback: deferred observer for request/response/shown/accepted/dismissed/error events
 "   enable_at_startup: enable llama.vim functionality at startup (default: v:true)
@@ -89,6 +90,7 @@ let s:default_config = {
     \ 'max_cache_keys':         250,
     \ 'context_providers':      [],
     \ 'context_providers_enabled': v:true,
+    \ 'debug_snapshot_enabled': v:false,
     \ 'debug_snapshot_callback': '',
     \ 'fim_event_callback':     '',
     \ 'ring_n_chunks':          16,
@@ -980,6 +982,16 @@ function! s:fim_callback_enabled(Callback) abort
         \ || (type(a:Callback) == v:t_string && !empty(a:Callback))
 endfunction
 
+function! s:fim_lifecycle_observer_enabled() abort
+    return s:fim_callback_enabled(get(g:llama_config, 'fim_event_callback', ''))
+endfunction
+
+function! s:fim_request_snapshot_enabled() abort
+    return get(g:llama_config, 'debug_snapshot_enabled', v:false)
+        \ || s:fim_callback_enabled(get(g:llama_config, 'debug_snapshot_callback', ''))
+        \ || s:fim_lifecycle_observer_enabled()
+endfunction
+
 function! s:fim_invoke_callback(label, Callback, event) abort
     try
         if type(a:Callback) == v:t_func
@@ -1012,14 +1024,24 @@ function! s:fim_schedule_callback(config_key, label, event) abort
 endfunction
 
 function! s:fim_emit_event(event) abort
+    let l:kind = get(a:event, 'event', '')
+    let l:lifecycle_enabled = s:fim_lifecycle_observer_enabled()
+    let l:snapshot_enabled = l:kind ==# 'request'
+        \ && s:fim_callback_enabled(get(g:llama_config, 'debug_snapshot_callback', ''))
+    if !l:lifecycle_enabled && !l:snapshot_enabled
+        return
+    endif
+
     let l:event = deepcopy(a:event)
     let l:event.schema_version = 1
     if !has_key(l:event, 'timestamp')
         let l:event.timestamp = s:fim_event_timestamp()
     endif
 
-    call s:fim_schedule_callback('fim_event_callback', 'fim_event_callback', l:event)
-    if get(l:event, 'event', '') ==# 'request'
+    if l:lifecycle_enabled
+        call s:fim_schedule_callback('fim_event_callback', 'fim_event_callback', l:event)
+    endif
+    if l:snapshot_enabled
         call s:fim_schedule_callback('debug_snapshot_callback', 'debug_snapshot_callback', l:event)
     endif
 endfunction
@@ -1266,17 +1288,24 @@ function! llama#fim(pos_x, pos_y, is_auto, prev, use_cache) abort
 
     let s:fim_request_id += 1
     let l:request_id = s:fim_request_id
-    let l:snapshot = s:fim_build_request_snapshot(
-        \ l:request,
-        \ l:request_id,
-        \ l:pos_x,
-        \ l:pos_y,
-        \ len(l:provider_extra),
-        \ a:is_auto,
-        \ a:prev,
-        \ a:use_cache)
-    let s:last_fim_snapshot = deepcopy(l:snapshot)
-    call s:fim_emit_event(l:snapshot)
+    if s:fim_request_snapshot_enabled()
+        let l:snapshot = s:fim_build_request_snapshot(
+            \ l:request,
+            \ l:request_id,
+            \ l:pos_x,
+            \ l:pos_y,
+            \ len(l:provider_extra),
+            \ a:is_auto,
+            \ a:prev,
+            \ a:use_cache)
+        " The dispatcher owns any callback copies. Keep this request snapshot
+        " directly and copy it only when the public debug API is called.
+        let s:last_fim_snapshot = l:snapshot
+        call s:fim_emit_event(l:snapshot)
+    else
+        " Release a previously retained payload when capture has been disabled.
+        let s:last_fim_snapshot = {}
+    endif
 
     " send the request asynchronously
     let l:request_json = json_encode(l:request)
@@ -1349,27 +1378,31 @@ function! s:fim_on_response(hashes, request_id, job_id, data, event = v:null)
         let l:responses = l:decoded
     endif
 
-    let l:public_responses = deepcopy(l:responses)
-    let l:tokens_cached = !empty(l:public_responses)
-        \ ? get(l:public_responses[0], 'tokens_cached', v:null)
+    let l:tokens_cached = !empty(l:responses)
+        \ ? get(l:responses[0], 'tokens_cached', v:null)
         \ : v:null
+    let l:observe_lifecycle = s:fim_lifecycle_observer_enabled()
 
     if get(s:last_fim_snapshot, 'request_id', -1) == a:request_id
         let s:last_fim_snapshot.tokens_cached = l:tokens_cached
     endif
 
-    call s:fim_emit_event({
-        \ 'event': 'response',
-        \ 'request_id': a:request_id,
-        \ 'responses': l:public_responses,
-        \ 'tokens_cached': l:tokens_cached,
-        \ })
+    if l:observe_lifecycle
+        call s:fim_emit_event({
+            \ 'event': 'response',
+            \ 'request_id': a:request_id,
+            \ 'responses': deepcopy(l:responses),
+            \ 'tokens_cached': l:tokens_cached,
+            \ })
+    endif
 
-    " Keep request correlation alongside cached responses. The internal key is
-    " removed from observer payloads and never reaches llama-server.
-    for l:resp in l:responses
-        let l:resp['_llama_request_id'] = a:request_id
-    endfor
+    if l:observe_lifecycle
+        " Keep request correlation alongside cached responses. The internal key
+        " is removed from observer payloads and never reaches llama-server.
+        for l:resp in l:responses
+            let l:resp['_llama_request_id'] = a:request_id
+        endfor
+    endif
 
     " insert each response into the cache ring buffer
     for l:hash in a:hashes
@@ -1393,11 +1426,13 @@ endfunction
 function! s:fim_on_exit(request_id, job_id, exit_code, event = v:null)
     if a:exit_code != 0
         echom "FIM job failed with exit code: " . a:exit_code
-        call s:fim_emit_event({
-            \ 'event': 'error',
-            \ 'request_id': a:request_id,
-            \ 'exit_code': a:exit_code,
-            \ })
+        if s:fim_lifecycle_observer_enabled()
+            call s:fim_emit_event({
+                \ 'event': 'error',
+                \ 'request_id': a:request_id,
+                \ 'exit_code': a:exit_code,
+                \ })
+        endif
     endif
 
     let s:current_job_fim = v:null
@@ -1791,21 +1826,23 @@ function! s:fim_render(pos_x, pos_y, responses, selected)
     let s:fim_data['selected']    = a:selected
     let s:fim_data['request_id']  = l:request_id
 
-    call s:fim_emit_event({
-        \ 'event': 'shown',
-        \ 'request_id': l:request_id,
-        \ 'buffer': s:fim_buffer_path(l:bufnr),
-        \ 'bufnr': l:bufnr,
-        \ 'cursor_line': l:pos_y,
-        \ 'cursor_col': l:pos_x,
-        \ 'selected': a:selected,
-        \ 'response_count': len(a:responses),
-        \ 'can_accept': l:can_accept,
-        \ 'content': deepcopy(l:content),
-        \ 'tokens_cached': l:n_cached,
-        \ 'truncated': l:truncated,
-        \ 'response': s:fim_public_response(l:response),
-        \ })
+    if s:fim_lifecycle_observer_enabled()
+        call s:fim_emit_event({
+            \ 'event': 'shown',
+            \ 'request_id': l:request_id,
+            \ 'buffer': s:fim_buffer_path(l:bufnr),
+            \ 'bufnr': l:bufnr,
+            \ 'cursor_line': l:pos_y,
+            \ 'cursor_col': l:pos_x,
+            \ 'selected': a:selected,
+            \ 'response_count': len(a:responses),
+            \ 'can_accept': l:can_accept,
+            \ 'content': deepcopy(l:content),
+            \ 'tokens_cached': l:n_cached,
+            \ 'truncated': l:truncated,
+            \ 'response': s:fim_public_response(l:response),
+            \ })
+    endif
 endfunction
 
 " if accept_type == 'full', accept entire response
@@ -1822,18 +1859,21 @@ function! llama#fim_accept(accept_type)
     let l:content    = s:fim_data['content']
     let l:advance_to_next_line = v:false
     let l:did_accept = v:false
+    let l:observe_accept = s:fim_lifecycle_observer_enabled()
     let l:accepted_text = ''
 
-    " fim_render() appends the existing line suffix to the final displayed
-    " completion line. Remove it from observer data so accepted_text describes
-    " only what llama.vim contributed.
-    let l:suggested_content = copy(l:content)
-    let l:line_suffix = strpart(l:line_cur, l:pos_x)
-    if !empty(l:line_suffix) && !empty(l:suggested_content)
-        let l:last = l:suggested_content[-1]
-        let l:suffix_start = strlen(l:last) - strlen(l:line_suffix)
-        if l:suffix_start >= 0 && strpart(l:last, l:suffix_start) ==# l:line_suffix
-            let l:suggested_content[-1] = strpart(l:last, 0, l:suffix_start)
+    if l:observe_accept
+        " fim_render() appends the existing line suffix to the final displayed
+        " completion line. Remove it from observer data so accepted_text
+        " describes only what llama.vim contributed.
+        let l:suggested_content = copy(l:content)
+        let l:line_suffix = strpart(l:line_cur, l:pos_x)
+        if !empty(l:line_suffix) && !empty(l:suggested_content)
+            let l:last = l:suggested_content[-1]
+            let l:suffix_start = strlen(l:last) - strlen(l:line_suffix)
+            if l:suffix_start >= 0 && strpart(l:last, l:suffix_start) ==# l:line_suffix
+                let l:suggested_content[-1] = strpart(l:last, 0, l:suffix_start)
+            endif
         endif
     endif
 
@@ -1856,12 +1896,14 @@ function! llama#fim_accept(accept_type)
             call setline(l:pos_y, l:line_cur[:(l:pos_x - 1)] . l:word . l:suffix)
         endif
 
-        if a:accept_type ==# 'word'
-            let l:accepted_text = l:word
-        elseif a:accept_type ==# 'line'
-            let l:accepted_text = get(l:suggested_content, 0, '') . "\n"
-        else
-            let l:accepted_text = join(l:suggested_content, "\n")
+        if l:observe_accept
+            if a:accept_type ==# 'word'
+                let l:accepted_text = l:word
+            elseif a:accept_type ==# 'line'
+                let l:accepted_text = get(l:suggested_content, 0, '') . "\n"
+            else
+                let l:accepted_text = join(l:suggested_content, "\n")
+            endif
         endif
 
         " insert rest of suggestion
@@ -1891,25 +1933,27 @@ function! llama#fim_accept(accept_type)
             call cursor(l:pos_y + len(l:content) - 1, len(l:content[-1]) + 1)
         endif
 
-        let l:selected = get(s:fim_data, 'selected', 0)
-        let l:responses = get(s:fim_data, 'responses', [])
-        let l:response = {}
-        if l:selected >= 0 && l:selected < len(l:responses)
-            let l:response = s:fim_public_response(l:responses[l:selected])
+        if l:observe_accept
+            let l:selected = get(s:fim_data, 'selected', 0)
+            let l:responses = get(s:fim_data, 'responses', [])
+            let l:response = {}
+            if l:selected >= 0 && l:selected < len(l:responses)
+                let l:response = s:fim_public_response(l:responses[l:selected])
+            endif
+            let l:event_bufnr = get(s:fim_data, 'bufnr', bufnr('%'))
+            call s:fim_emit_event({
+                \ 'event': 'accepted',
+                \ 'request_id': get(s:fim_data, 'request_id', 0),
+                \ 'buffer': s:fim_buffer_path(l:event_bufnr),
+                \ 'bufnr': l:event_bufnr,
+                \ 'cursor_line': l:pos_y,
+                \ 'cursor_col': l:pos_x,
+                \ 'accept_type': a:accept_type,
+                \ 'accepted_text': l:accepted_text,
+                \ 'accepted_chars': strchars(l:accepted_text),
+                \ 'response': l:response,
+                \ })
         endif
-        let l:event_bufnr = get(s:fim_data, 'bufnr', bufnr('%'))
-        call s:fim_emit_event({
-            \ 'event': 'accepted',
-            \ 'request_id': get(s:fim_data, 'request_id', 0),
-            \ 'buffer': s:fim_buffer_path(l:event_bufnr),
-            \ 'bufnr': l:event_bufnr,
-            \ 'cursor_line': l:pos_y,
-            \ 'cursor_col': l:pos_x,
-            \ 'accept_type': a:accept_type,
-            \ 'accepted_text': l:accepted_text,
-            \ 'accepted_chars': strchars(l:accepted_text),
-            \ 'response': l:response,
-            \ })
     endif
 
     call llama#fim_hide(l:did_accept ? 'accepted' : 'not-acceptable')
@@ -1946,7 +1990,7 @@ function! llama#fim_hide(reason = 'dismissed')
     " remove the mappings from that same buffer
     call s:fim_unmap_keys(l:bufnr)
 
-    if l:was_shown && a:reason !=# 'accepted'
+    if l:was_shown && a:reason !=# 'accepted' && s:fim_lifecycle_observer_enabled()
         call s:fim_emit_event({
             \ 'event': 'dismissed',
             \ 'request_id': get(s:fim_data, 'request_id', 0),
@@ -2541,7 +2585,14 @@ endfunction
 function! llama#debug_show_snapshot(include_full = v:false) abort
     let l:snapshot = llama#debug_snapshot()
     if empty(l:snapshot)
-        call llama#debug_log('FIM snapshot', ['No FIM request has been sent yet.'])
+        if !s:fim_request_snapshot_enabled()
+            call llama#debug_log('FIM snapshot', [
+                \ 'Snapshot capture is disabled.',
+                \ 'Set g:llama_config.debug_snapshot_enabled = v:true, then trigger FIM.',
+                \ ])
+        else
+            call llama#debug_log('FIM snapshot', ['No observed FIM request has been sent yet.'])
+        endif
         call llama_debug#show()
         return {}
     endif
